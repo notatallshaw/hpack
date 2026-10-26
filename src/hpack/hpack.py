@@ -128,6 +128,32 @@ def decode_integer(data: bytes | memoryview, prefix_bits: int) -> tuple[int, int
     return number, index
 
 
+def _decode_literal_integer(data: bytes | memoryview, prefix_bits: int) -> tuple[int, int]:
+    """Decode literal integers and retain their byte-oriented error messages."""
+    try:
+        return decode_integer(data, prefix_bits)
+    except HPACKDecodingError:
+        if not isinstance(data, memoryview):
+            raise
+
+    # Leave the except block before retrying so the error chain is unchanged.
+    return decode_integer(data.tobytes(), prefix_bits)
+
+
+def _decode_literal_string(data: bytes | memoryview, start: int, length: int) -> bytes:
+    """Return a decoded literal string as owned bytes."""
+    field_data = data[start : start + length]
+    if len(field_data) != length:
+        msg = "Truncated header block"
+        raise HPACKDecodingError(msg)
+
+    if data[0] & 0x80:
+        return decode_huffman(field_data)
+    if isinstance(field_data, memoryview):
+        return field_data.tobytes()
+    return field_data
+
+
 def _dict_to_iterable(header_dict: dict[bytes | str, bytes | str]) \
         -> Iterable[tuple[bytes | str, bytes | str]]:
     """
@@ -600,7 +626,11 @@ class Decoder:
         Decodes a header represented with a literal.
         """
         if isinstance(data, memoryview):
-            data = data.tobytes()  # pragma: no cover
+            if type(data.obj) is bytes and data.ndim == 1 and data.format == "B" and data.c_contiguous:
+                # Own the handle so releasing the caller's view cannot invalidate it.
+                data = data[:]
+            else:
+                data = data.tobytes()  # pragma: no cover
 
         total_consumed = 0
 
@@ -620,7 +650,7 @@ class Decoder:
 
         if indexed_name:
             # Indexed header name.
-            index, consumed = decode_integer(data, name_len)
+            index, consumed = _decode_literal_integer(data, name_len)
             name = self.header_table.get_by_index(index)[0]
 
             total_consumed = consumed
@@ -630,27 +660,15 @@ class Decoder:
             # move forward.
             data = data[1:]
 
-            length, consumed = decode_integer(data, 7)
-            name = data[consumed:consumed + length]
-            if len(name) != length:
-                msg = "Truncated header block"
-                raise HPACKDecodingError(msg)
-
-            if data[0] & 0x80:
-                name = decode_huffman(name)
+            length, consumed = _decode_literal_integer(data, 7)
+            name = _decode_literal_string(data, consumed, length)
             total_consumed = consumed + length + 1  # Since we moved forward 1.
 
-        data = data[consumed + length:]
+        data = data[consumed + length :]
 
         # The header value is definitely length-based.
-        length, consumed = decode_integer(data, 7)
-        value = data[consumed:consumed + length]
-        if len(value) != length:
-            msg = "Truncated header block"
-            raise HPACKDecodingError(msg)
-
-        if data[0] & 0x80:
-            value = decode_huffman(value)
+        length, consumed = _decode_literal_integer(data, 7)
+        value = _decode_literal_string(data, consumed, length)
 
         # Updated the total consumed length.
         total_consumed += length + consumed
